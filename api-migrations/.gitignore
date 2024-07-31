@@ -1,6 +1,8 @@
 #Global
 node_modules
 dist
+*.env
+!*.example.env
 
 #TypeScript
 tsconfig.tsbuildinfo

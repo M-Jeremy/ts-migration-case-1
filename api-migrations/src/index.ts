@@ -24,120 +24,121 @@ export default defineHook(({ action }, hookExtensionContext) => {
 
   const connectionUrl = buildConnectionUrlFromEnvVariables();
 
-  action('server.start', (): void => {
-    const handler = async () => {
-      // Action hooks executes when server starts
-      logger.info('Running My migrations...');
+  const handler = async () => {
+    // Action hooks executes when server starts
+    logger.info('Running My migrations...');
 
-      // Get Completed migrations from database
-      const completedMigrations = (await database
-        .select('*')
-        .from(HF_MIGRATION_TABLE_NAME)
-        .orderBy('version')) as MyMigrations[];
-      logger.info(`Found ${completedMigrations.length} migrations in db`);
+    // Get Completed migrations from database
+    const completedMigrations = (await database
+      .select('*')
+      .from(HF_MIGRATION_TABLE_NAME)
+      .orderBy('version')) as MyMigrations[];
+    logger.info(`Found ${completedMigrations.length} migrations in db`);
 
-      // Get migrations files
-      const migrationsFolderPath = path.join(__dirname, MIGRATIONS_FOLDER_NAME);
-      const migrationFiles = readdirSync(migrationsFolderPath).filter((file) =>
-        file.endsWith('.js')
+    // Get migrations files
+    const migrationsFolderPath = path.join(__dirname, MIGRATIONS_FOLDER_NAME);
+    const migrationFiles = readdirSync(migrationsFolderPath).filter((file) =>
+      file.endsWith('.js')
+    );
+
+    let customerMigrationsFolderPath: string;
+    let customerMigrationFiles: string[];
+    let migrations: MigrationFile[];
+
+    try {
+      customerMigrationsFolderPath = path.join(
+        migrationsFolderPath,
+        getCustomerName()
       );
-      
-      let customerMigrationsFolderPath: string;
-      let customerMigrationFiles: string[];
-      let migrations: MigrationFile[];
 
-      try {
-        customerMigrationsFolderPath = path.join(
-          migrationsFolderPath,
-          getCustomerName()
+      customerMigrationFiles = existsSync(customerMigrationsFolderPath)
+        ? readdirSync(customerMigrationsFolderPath).filter((file) =>
+          file.endsWith('.js')
+        )
+        : [];
+
+      migrations = [
+        ...migrationFiles.map((filename) => parseFileName(filename)),
+        ...customerMigrationFiles.map((filename) =>
+          parseFileName(filename, true)
+        ),
+      ].sort((a, b) => (a.version > b.version ? 1 : -1));
+    } catch (error) {
+      logger.info(
+        `Customer name is not set. Only general migrations will run.`
+      );
+      logger.warn(error);
+      migrations = [
+        ...migrationFiles.map((filename) => parseFileName(filename)),
+      ].sort((a, b) => (a.version > b.version ? 1 : -1));
+    }
+
+    function parseFileName(fileName: string, custom = false) {
+      const version = fileName.split('-')[0] || '-1';
+      return {
+        file: path.join(
+          custom ? customerMigrationsFolderPath : migrationsFolderPath,
+          fileName
+        ),
+        name: fileName.split('-').slice(1).join(' ').split('.')[0],
+        version: version,
+        completed: !!completedMigrations.find(
+          (migration) => migration.version === version
+        ),
+      };
+    }
+
+    logger.info(`Found ${migrations.length} My migrations file`);
+
+    const migrationKeys = new Set(migrations.map((m) => m.version));
+    if (migrations.length > migrationKeys.size) {
+      throw new Error(
+        'Migration keys collide! Please ensure that every migration uses a unique key.'
+      );
+    }
+
+    if (migrations && migrations.length > 0) {
+      const headers = getConnectionHeaders();
+      if (!headers) {
+        logger.error(
+          `No headers generated, migrations will not be run !`
         );
-
-        customerMigrationFiles = existsSync(customerMigrationsFolderPath)
-          ? readdirSync(customerMigrationsFolderPath).filter((file) =>
-              file.endsWith('.js')
-            )
-          : [];
-
-        migrations = [
-          ...migrationFiles.map((filename) => parseFileName(filename)),
-          ...customerMigrationFiles.map((filename) =>
-            parseFileName(filename, true)
-          ),
-        ].sort((a, b) => (a.version > b.version ? 1 : -1));
-      } catch (error) {
-        logger.info(
-          `Customer name is not set. Only general migrations will run.`
-        );
-        logger.warn(error);
-        migrations = [
-          ...migrationFiles.map((filename) => parseFileName(filename)),
-        ].sort((a, b) => (a.version > b.version ? 1 : -1));
+        return;
       }
-
-      function parseFileName(fileName: string, custom = false) {
-        const version = fileName.split('-')[0] || '-1';
-        return {
-          file: path.join(
-            custom ? customerMigrationsFolderPath : migrationsFolderPath,
-            fileName
-          ),
-          name: fileName.split('-').slice(1).join(' ').split('.')[0],
-          version: version,
-          completed: !!completedMigrations.find(
-            (migration) => migration.version === version
-          ),
+      const migrationsToApply = migrations.filter((m) => !m.completed);
+      logger.info(`${migrationsToApply.length} migrations left to apply`);
+      for (const migration of migrationsToApply) {
+        const migrationName = migration.name as string;
+        logger.info(`Applying "${migrationName}" ...`);
+        // eslint-disable-next-line  @typescript-eslint/no-var-requires
+        const { up } = require(migration.file) as {
+          up: MyMigrationsUp;
         };
-      }
-
-      logger.info(`Found ${migrations.length} My migrations file`);
-
-      const migrationKeys = new Set(migrations.map((m) => m.version));
-      if (migrations.length > migrationKeys.size) {
-        throw new Error(
-          'Migration keys collide! Please ensure that every migration uses a unique key.'
-        );
-      }
-
-      if (migrations && migrations.length > 0) {
-        const headers = getConnectionHeaders();
-        if (!headers) {
-          logger.error(
-            `No headers generated, migrations will not be run !`
+        try {
+          await retryAsync(
+            async () => {
+              await up(connectionUrl, headers);
+            },
+            { delay: 1000, maxTry: 2 }
           );
+          logger.info(`migration "${migrationName}" ✔ Done`);
+          await database
+            .insert({
+              version: migration.version,
+              name: migrationName,
+            })
+            .into(HF_MIGRATION_TABLE_NAME);
+        } catch (error) {
+          logger.info(`Error during migration: "${migrationName}"`);
+          logger.error(error);
           return;
         }
-        const migrationsToApply = migrations.filter((m) => !m.completed);
-        logger.info(`${migrationsToApply.length} migrations left to apply`);
-        for (const migration of migrationsToApply) {
-          const migrationName = migration.name as string;
-          logger.info(`Applying "${migrationName}" ...`);
-          // eslint-disable-next-line  @typescript-eslint/no-var-requires
-          const { up } = require(migration.file) as {
-            up: MyMigrationsUp;
-          };
-          try {
-            await retryAsync(
-              async () => {
-                await up(connectionUrl, headers);
-              },
-              { delay: 1000, maxTry: 2 }
-            );
-            logger.info(`migration "${migrationName}" ✔ Done`);
-            await database
-              .insert({
-                version: migration.version,
-                name: migrationName,
-              })
-              .into(HF_MIGRATION_TABLE_NAME);
-          } catch (error) {
-            logger.info(`Error during migration: "${migrationName}"`);
-            logger.error(error);
-            return;
-          }
-        }
       }
-      logger.info('My migrations. ✔ Done');
-    };
+    }
+    logger.info('My migrations. ✔ Done');
+  };
+
+  action('server.start', (): void => {
     handler().catch((err) => {
       logger.error(err);
     });
